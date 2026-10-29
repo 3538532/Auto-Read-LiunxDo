@@ -1,9 +1,12 @@
 name: readLike（自动阅读随机点赞）
 # GitHub.secrets优先级最高，即使没有设置对应的变量，它也会读取，这时变量为空值，导致报错，.env读取的变量无法覆盖这个值,使用了${PASSWORD_ESCAPED//\#/\\#}来对#转义,需要两个\，但是我直接在env文件使用这种方法是不行的，GitHub action是有效
 on:
-  schedule:
-    # 每天 UTC 时间 10:26 运行（北京时间 18:26）
-    - cron: "26 10 * * *"
+  # 定时运行已关闭：linux.do 屏蔽/限流 GitHub Actions 机房 IP（429/空白错误页），
+  # 自动运行只会稳定失败。恢复方法：取消下面 schedule 的注释即可。
+  # 建议先配置代理 secret（PROXY_URL）或改用本地/自有服务器运行后再启用。
+  # schedule:
+  #   # 每天 UTC 时间 10:26 运行（北京时间 18:26）
+  #   - cron: "26 10 * * *"
   workflow_dispatch: # 允许手动触发
 
 jobs:

@@ -70,7 +70,7 @@ console.log(
 // 设置一个定时器，在运行时间到达时终止进程
 const shutdownTimer = setTimeout(() => {
   console.log("时间到,Reached time limit, shutting down the process...");
-  process.exit(0); // 退出进程
+  process.exit(hasLoginFailure ? 1 : 0); // 退出进程（存在登录失败时以非零码退出）
 }, runTimeLimitMillis);
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -83,6 +83,9 @@ const passwords = process.env.PASSWORDS ? process.env.PASSWORDS.split(",") : [];
 // 读取每个账号对应的Cookie（逗号分隔，与USERNAMES一一对应），有Cookie则跳过表单登录
 const cookiesEnv = process.env.COOKIES ? process.env.COOKIES.split(",") : [];
 const loginUrl = process.env.WEBSITE || "https://linux.do"; //在GitHub action环境里它不能读取默认环境变量,只能在这里设置默认值
+console.log("目标网站(loginUrl):", loginUrl);
+// 是否有账号登录失败（用于最后以非零退出码结束，让 GitHub Actions 标记为失败）
+let hasLoginFailure = false;
 const delayBetweenInstances = 10000;
 const totalAccounts = usernames.length; // 总的账号数
 const delayBetweenBatches =
@@ -257,8 +260,11 @@ function delayClick(time) {
       const batch = loginTasks
         .slice(i, i + maxConcurrentAccounts)
         .map(async (task) => {
-          const { browser } = await task(); // 运行任务并获取浏览器实例
-          return browser;
+          const res = await task(); // 运行任务并获取浏览器实例与登录结果
+          if (res && res.success === false) {
+            hasLoginFailure = true;
+          }
+          return res.browser;
         }); // 等待当前批次的任务完成
       const browsers = await Promise.all(batch); // Task里面的任务本身是没有进行await的, 所以会继续执行下面的代码
 
@@ -285,6 +291,14 @@ function delayClick(time) {
     console.log("所有账号登录操作已完成");
     // 等待所有登录操作完成
     // await Promise.all(loginTasks);
+    if (hasLoginFailure) {
+      console.log(
+        "存在账号登录失败，进程将以非零退出码结束，让 GitHub Actions 标记本次运行为失败"
+      );
+      // 给 Telegram 通知留出发送时间
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      process.exit(1);
+    }
   } catch (error) {
     // 错误处理逻辑
     console.error("发生错误：", error);
@@ -309,6 +323,8 @@ function parseCookieString(cookieStr, domain) {
 
 async function launchBrowserForUser(username, password, cookie = null) {
   let browser = null; // 在 try 之外声明 browser 变量
+  let page = null; // 在 try 之外声明 page 变量，供 catch 中做失败诊断
+  let loginSucceeded = false; // 登录是否成功（用于最终退出码）
   try {
     console.log("当前用户:", maskUsername(username));
     const browserOptions = {
@@ -337,8 +353,9 @@ async function launchBrowserForUser(username, password, cookie = null) {
     }
 
     var { connect } = await import("puppeteer-real-browser");
-    const { page, browser: newBrowser } = await connect(browserOptions);
-    browser = newBrowser; // 将 browser 初始化
+    const conn = await connect(browserOptions);
+    page = conn.page; // 页面对象
+    browser = conn.browser; // 将 browser 初始化
     // 启动截图功能
     // takeScreenshots(page);
     //登录操作
@@ -430,6 +447,7 @@ async function launchBrowserForUser(username, password, cookie = null) {
       throw new Error("登录失败：页面显示未登录状态（auth-buttons）");
     } else if (avatarImg) {
       console.log("找到avatarImg，登录成功");
+      loginSucceeded = true;
     } else {
       console.log("未找到avatarImg，登录失败");
       throw new Error("登录失败");
@@ -571,14 +589,21 @@ async function launchBrowserForUser(username, password, cookie = null) {
         await new Promise((r) => setTimeout(r, 500));
       });
     }
-    return { browser };
+    return { browser, success: loginSucceeded };
   } catch (err) {
     // throw new Error(err);
     console.log("Error in launchBrowserForUser:", err);
+    // 输出失败时的页面诊断信息，便于判断是网站屏蔽/限流还是登录本身的问题
+    try {
+      const diag = await getPageDiagnostics(page);
+      console.log("失败时的页面诊断：", JSON.stringify(diag).slice(0, 800));
+    } catch (e) {
+      console.log("无法获取页面诊断信息:", e && e.message ? e.message : e);
+    }
     if (token && chatId) {
       sendToTelegram(`${err.message}`);
     }
-    return { browser }; // 错误时仍然返回 browser
+    return { browser, success: false }; // 错误时仍然返回 browser
   }
 }
 async function login(page, username, password, retryCount = 3) {
@@ -687,35 +712,109 @@ async function login(page, username, password, retryCount = 3) {
   await delayClick(1000);
 }
 
-async function navigatePage(url, page, browser) {
+// 常见 Cloudflare 验证页/屏蔽页的标题特征（统一转小写比较）
+const CF_CHALLENGE_TITLES = [
+  "just a moment",
+  "请稍候",
+  "checking your browser",
+  "checking if the site connection is secure",
+  "verify you are human",
+  "attention required",
+  "access denied",
+  "sorry, you have been blocked",
+  "enable javascript and cookies to continue",
+];
+// 常见 Cloudflare 验证页/屏蔽页的正文特征
+const CF_CHALLENGE_MARKERS = [
+  "cf-browser-verification",
+  "challenge-platform",
+  "cf-chl",
+  "ray id",
+  "checking your browser before accessing",
+  "sorry, you have been blocked",
+];
+
+// 获取页面诊断信息（URL、标题、正文片段），用于判断页面是否被屏蔽/验证
+async function getPageDiagnostics(page) {
+  try {
+    return await page.evaluate(() => {
+      const bodyText = document.body ? document.body.innerText : "";
+      return {
+        url: location.href,
+        title: document.title || "",
+        bodyLength: bodyText.length,
+        bodyText: bodyText.replace(/\s+/g, " ").slice(0, 300),
+      };
+    });
+  } catch (e) {
+    return { error: e && e.message ? e.message : String(e) };
+  }
+}
+
+// 判断页面是否处于 Cloudflare 验证/被屏蔽/空白状态
+function looksBlocked(diag) {
+  if (!diag || diag.error) return true;
+  const title = (diag.title || "").toLowerCase();
+  if (CF_CHALLENGE_TITLES.some((t) => title.includes(t))) return true;
+  const bodyText = (diag.bodyText || "").toLowerCase();
+  if (CF_CHALLENGE_MARKERS.some((m) => bodyText.includes(m))) return true;
+  // 标题为空且正文几乎没有内容：典型的是被 CDN/网站返回的空错误页（如 403/429/502）
+  if (!diag.title && (diag.bodyLength || 0) < 50) return true;
+  return false;
+}
+
+async function navigatePage(url, page, browser, retries = 3) {
   try {
     page.setDefaultNavigationTimeout(
       parseInt(process.env.NAV_TIMEOUT_MS || process.env.NAV_TIMEOUT || "120000", 10)
     );
   } catch {}
-  await page.goto(url, { waitUntil: "domcontentloaded" }); //如果使用默认的load,linux下页面会一直加载导致无法继续执行
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded" }); //如果使用默认的load,linux下页面会一直加载导致无法继续执行
+    } catch (e) {
+      console.log(`页面导航失败(第${attempt}/${retries}次): ${e && e.message ? e.message : e}`);
+      if (attempt === retries) throw e;
+      await delayClick(5000 * attempt);
+      continue;
+    }
 
-  const startTime = Date.now(); // 记录开始时间
-  let pageTitle = await page.title(); // 获取当前页面标题
+    // 等待页面标题/内容稳定：Cloudflare 验证可能需要几秒到几十秒自动通过
+    const startTime = Date.now();
+    let diag = await getPageDiagnostics(page);
+    while (looksBlocked(diag) && Date.now() - startTime < 45000) {
+      console.log(
+        "页面可能处于 Cloudflare 验证/屏蔽状态，等待其自动通过...",
+        JSON.stringify({ title: diag.title, url: diag.url })
+      );
+      await delayClick(3000); // 每次检查间隔3秒
+      diag = await getPageDiagnostics(page);
+    }
 
-  while (pageTitle.includes("Just a moment") || pageTitle.includes("请稍候")) {
-    console.log("The page is under Cloudflare protection. Waiting...");
+    console.log("页面标题：", diag.title || "(空)");
+    if (diag.url) console.log("页面URL：", diag.url);
 
-    await delayClick(2000); // 每次检查间隔2秒
+    if (!looksBlocked(diag)) return; // 页面正常，继续
 
-    // 重新获取页面标题
-    pageTitle = await page.title();
-
-    // 检查是否超过15秒
-    if (Date.now() - startTime > 35000) {
-      console.log("Timeout exceeded, aborting actions.");
-      sendToTelegram(`超时了,无法通过Cloudflare验证`);
-      await browser.close();
-      // todo: 这里其实不能关的m因为我们是在最后统一关的你不能在这里关m如果你在这关,后面就会触发attempted to sue detached frame
-      return; // 超时则退出函数
+    // 仍然异常：输出诊断信息，准备重试
+    console.log(
+      "页面疑似被屏蔽/限流或验证未通过，诊断信息：",
+      JSON.stringify(diag).slice(0, 800)
+    );
+    if (token && chatId) {
+      sendToTelegram(
+        `目标网站页面异常(第${attempt}/${retries}次): ${diag.title || "(空标题)"} | ${diag.url || url}`
+      );
+    }
+    if (attempt < retries) {
+      console.log(`${10 * attempt} 秒后重试导航...`);
+      await delayClick(10000 * attempt);
     }
   }
-  console.log("页面标题：", pageTitle);
+  // 多次重试后页面仍异常：不关闭浏览器（由外层统一关闭），交由后续登录逻辑失败并输出诊断
+  console.log(
+    "警告：多次导航后页面仍异常，当前IP可能已被目标网站屏蔽/限流（GitHub Actions 机房IP常见），可尝试配置代理(PROXY_URL)或本地运行"
+  );
 }
 
 // 每秒截图功能
